@@ -19,6 +19,7 @@ services:
       - ./microservicio-tif/.env
     environment:
       - DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
+      - IA_SERVICE_URL=http://agro-ia:8002
     depends_on:
       - dynamodb-local
     volumes:
