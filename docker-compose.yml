@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: agro-dynamodb-local
+    ports:
+      - "8005:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+
+  agro-tif:
+    build:
+      context: ./microservicio-tif
+    container_name: agro-tif
+    ports:
+      - "8001:8001"
+    env_file:
+      - ./microservicio-tif/.env
+    environment:
+      - DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
+    depends_on:
+      - dynamodb-local
+    volumes:
+      - /tmp/agro-tif:/tmp
+
+  agro-ia:
+    build:
+      context: ./microservicio-ia
+    container_name: agro-ia
+    ports:
+      - "8002:8002"
+    env_file:
+      - ./microservicio-ia/.env
+    environment:
+      - DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
+    depends_on:
+      - dynamodb-local
