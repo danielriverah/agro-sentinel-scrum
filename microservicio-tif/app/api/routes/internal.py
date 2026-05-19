@@ -1,5 +1,7 @@
 from fastapi import APIRouter
 
+from app.core import config
+
 router = APIRouter(prefix="/internal", tags=["internal"])
 
 
@@ -11,3 +13,20 @@ async def config_validate():
 @router.post("/config/refresh")
 async def config_refresh():
     return {"status": "not_implemented"}
+
+
+@router.get("/config/view")
+async def config_view():
+    return {
+        "app_env": config.APP_ENV,
+        "aws_region": config.AWS_REGION,
+        "config_table_name": config.CONFIG_TABLE_NAME,
+        "config_partition_key": config.CONFIG_PARTITION_KEY,
+        "config_sort_key": config.CONFIG_SORT_KEY,
+        "config_cache_ttl_seconds": config.CONFIG_CACHE_TTL_SECONDS,
+        "config_fail_fast": config.CONFIG_FAIL_FAST,
+        "dynamodb_endpoint_url": config.DYNAMODB_ENDPOINT_URL,
+        "ia_service_url": config.IA_SERVICE_URL,
+        "monitoring_s3_bucket": config.MONITORING_S3_BUCKET,
+        "monitoring_s3_prefix": config.MONITORING_S3_PREFIX,
+    }

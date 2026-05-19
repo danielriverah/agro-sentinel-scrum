@@ -13,3 +13,5 @@ CONFIG_CACHE_TTL_SECONDS: int = int(os.getenv("CONFIG_CACHE_TTL_SECONDS", "60"))
 CONFIG_FAIL_FAST: bool = os.getenv("CONFIG_FAIL_FAST", "true").lower() == "true"
 DYNAMODB_ENDPOINT_URL: str | None = os.getenv("DYNAMODB_ENDPOINT_URL")
 IA_SERVICE_URL: str = os.getenv("IA_SERVICE_URL", "http://agro-ia:8002")
+MONITORING_S3_BUCKET: str | None = os.getenv("MONITORING_S3_BUCKET")
+MONITORING_S3_PREFIX: str = os.getenv("MONITORING_S3_PREFIX", "")
