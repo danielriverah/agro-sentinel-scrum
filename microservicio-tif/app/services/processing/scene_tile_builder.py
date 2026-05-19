@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import numpy as np
 import rasterio
+import matplotlib.cm as cm
 from PIL import Image
 from pyproj import Transformer
 from rasterio.windows import Window
@@ -65,6 +66,9 @@ class SceneTileBuilder:
                 dst.write(arr, idx)
 
         pngs = self._render_previews(out_dir, band_arrays, bands)
+        indices = self._compute_indices(band_arrays, bands)
+        thematic_pngs = self._render_thematic_layers(out_dir, indices)
+        decision_summary = self._decision_summary(indices)
         ndvi_mean = self._compute_ndvi_mean(band_arrays, bands)
         return {
             "scene_name": scene_name,
@@ -74,13 +78,20 @@ class SceneTileBuilder:
             "pngs": pngs,
             "output_dir": str(out_dir),
             "indices": {"ndvi": {"mean": ndvi_mean}} if ndvi_mean is not None else {},
+            "index_stats": {
+                k: {"mean": round(float(np.nanmean(v)), 4)} for k, v in indices.items() if np.isfinite(v).any()
+            },
+            "thematic_pngs": thematic_pngs,
+            "decision_summary": decision_summary,
         }
 
     def _render_previews(self, out_dir: Path, band_arrays: list[np.ndarray], bands: list[str]) -> list[str]:
         lookup = {band: band_arrays[i] for i, band in enumerate(bands)}
         previews: list[tuple[str, list[str]]] = [
-            ("true_color.png", ["B04", "B03", "B02"]),
+            ("natural.png", ["B04", "B03", "B02"]),
             ("false_color_veg.png", ["B08", "B04", "B03"]),
+            ("red_edge.png", ["B07", "B06", "B05"]),
+            ("swir.png", ["B12", "B11", "B08"]),
         ]
         saved: list[str] = []
         for filename, combo in previews:
@@ -117,3 +128,77 @@ class SceneTileBuilder:
         if valid.size == 0:
             return None
         return round(float(np.mean(valid)), 4)
+
+    @staticmethod
+    def _compute_indices(band_arrays: list[np.ndarray], bands: list[str]) -> dict[str, np.ndarray]:
+        lookup = {band: band_arrays[i].astype("float32") for i, band in enumerate(bands)}
+
+        def ratio(a: str, b: str) -> np.ndarray:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                return (lookup[a] - lookup[b]) / (lookup[a] + lookup[b])
+
+        out: dict[str, np.ndarray] = {}
+        if "B08" in lookup and "B04" in lookup:
+            out["ndvi"] = ratio("B08", "B04")
+            out["savi"] = 1.5 * (lookup["B08"] - lookup["B04"]) / (lookup["B08"] + lookup["B04"] + 0.5)
+            out["evi"] = 2.5 * (lookup["B08"] - lookup["B04"]) / (lookup["B08"] + 6 * lookup["B04"] - 7.5 * lookup.get("B02", lookup["B04"]) + 1)
+        if "B8A" in lookup and "B05" in lookup:
+            out["ndre"] = ratio("B8A", "B05")
+        if "B08" in lookup and "B11" in lookup:
+            out["ndmi"] = ratio("B08", "B11")
+        if "B08" in lookup and "B03" in lookup:
+            out["gndvi"] = ratio("B08", "B03")
+        if "B08" in lookup and "B12" in lookup:
+            out["nbr"] = ratio("B08", "B12")
+        return out
+
+    def _render_thematic_layers(self, out_dir: Path, indices: dict[str, np.ndarray]) -> list[str]:
+        cmap_map = {
+            "ndvi": "RdYlGn",
+            "ndre": "RdYlGn",
+            "ndmi": "RdYlBu",
+            "savi": "RdYlGn",
+            "evi": "RdYlGn",
+            "gndvi": "RdYlGn",
+            "nbr": "YlOrRd",
+        }
+        saved: list[str] = []
+        for name, arr in indices.items():
+            cmap_name = cmap_map.get(name, "viridis")
+            norm = np.clip((arr + 1.0) / 2.0, 0, 1)
+            norm = np.nan_to_num(norm, nan=0.5)
+            rgba = (cm.get_cmap(cmap_name)(norm) * 255).astype(np.uint8)
+            img = Image.fromarray(rgba, mode="RGBA")
+            out = out_dir / f"{name}.png"
+            img.save(out)
+            saved.append(str(out))
+        return saved
+
+    @staticmethod
+    def _decision_summary(indices: dict[str, np.ndarray]) -> dict[str, str]:
+        def m(name: str) -> float | None:
+            arr = indices.get(name)
+            if arr is None:
+                return None
+            valid = arr[np.isfinite(arr)]
+            if valid.size == 0:
+                return None
+            return float(np.mean(valid))
+
+        ndvi = m("ndvi")
+        ndmi = m("ndmi")
+        ndre = m("ndre")
+        nbr = m("nbr")
+
+        return {
+            "vigor_vegetal": "alto" if (ndvi is not None and ndvi >= 0.65) else "medio/bajo",
+            "estres_hidrico": "alto" if (ndmi is not None and ndmi < 0.1) else "bajo/medio",
+            "humedad": "baja" if (ndmi is not None and ndmi < 0.15) else "aceptable",
+            "enfermedades": "posible alerta" if (ndre is not None and ndre < 0.2) else "sin alerta fuerte",
+            "suelo_desnudo": "presente" if (ndvi is not None and ndvi < 0.35) else "bajo",
+            "malezas": "revisar campo" if (ndvi is not None and ndvi > 0.45 and ndre is not None and ndre < 0.18) else "sin señal fuerte",
+            "inundaciones": "riesgo" if (ndmi is not None and ndmi > 0.45) else "sin señal fuerte",
+            "salinidad": "posible" if (ndvi is not None and ndvi < 0.3 and ndmi is not None and ndmi < 0.1) else "sin señal fuerte",
+            "quemas": "posible" if (nbr is not None and nbr < 0.1) else "sin evidencia",
+            "estructura_cultivo": "heterogenea" if (ndvi is not None and 0.35 <= ndvi <= 0.65) else "relativamente uniforme",
+        }

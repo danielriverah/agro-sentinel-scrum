@@ -1,18 +1,35 @@
 from fastapi import APIRouter
 
 from app.core import config
+from app.services.configuration.config_loader import get_config, invalidate_cache
+from app.services.configuration.config_validator import validate_tif_config
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
 
 @router.get("/config/validate")
 async def config_validate():
-    return {"status": "not_implemented"}
+    cfg = get_config()
+    missing = validate_tif_config(cfg)
+    return {
+        "ok": len(missing) == 0,
+        "error_code": "CONFIG_VALIDATION_ERROR" if missing else None,
+        "missing": missing,
+        "config_version": cfg.get("version"),
+    }
 
 
 @router.post("/config/refresh")
 async def config_refresh():
-    return {"status": "not_implemented"}
+    invalidate_cache()
+    cfg = get_config()
+    missing = validate_tif_config(cfg)
+    return {
+        "ok": len(missing) == 0,
+        "error_code": "CONFIG_VALIDATION_ERROR" if missing else None,
+        "missing": missing,
+        "config_version": cfg.get("version"),
+    }
 
 
 @router.get("/config/view")

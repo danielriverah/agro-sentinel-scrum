@@ -169,6 +169,7 @@ async def _run_production_analysis(payload: ProductionSceneRequest) -> dict[str,
 
 
 def _serialize_result(result: dict[str, Any], payload: ProductionSceneRequest | None = None) -> dict[str, Any]:
+    thematic_pngs = result.get("thematic_pngs", [])
     output = {
         "ok": True,
         "scene_name": result["scene_name"],
@@ -179,6 +180,9 @@ def _serialize_result(result: dict[str, Any], payload: ProductionSceneRequest | 
         "preview_pngs": [{"path": p, "url": _to_public_url(p)} for p in result["pngs"]],
         "output_dir": result["output_dir"],
         "indices": result.get("indices", {}),
+        "index_stats": result.get("index_stats", {}),
+        "decision_summary": result.get("decision_summary", {}),
+        "thematic_pngs": [{"path": p, "url": _to_public_url(p)} for p in thematic_pngs],
         "manual_mode": result.get("manual_mode", False),
         "source_mode": result.get("source_mode", "unknown"),
         "truth_tif_path": result.get("truth_tif_path"),
@@ -318,6 +322,16 @@ DASHBOARD_HTML = """
       </div>
       <div class="layout" style="margin-top:16px">
         <section class="card">
+          <h3 style="margin-top:0">Capas espectrales</h3>
+          <div id="layerGrid" class="grid"></div>
+        </section>
+        <section class="card">
+          <h3 style="margin-top:0">Resumen para decision</h3>
+          <div id="decisionCards" class="tiny"></div>
+        </section>
+      </div>
+      <div class="layout" style="margin-top:16px">
+        <section class="card">
           <h3 style="margin-top:0">Configuracion activa (solo lectura)</h3>
           <textarea id="configOutput" readonly></textarea>
         </section>
@@ -331,6 +345,8 @@ DASHBOARD_HTML = """
     const previewImg = document.getElementById("previewImg");
     const previewPath = document.getElementById("previewPath");
     const configOutput = document.getElementById("configOutput");
+    const layerGrid = document.getElementById("layerGrid");
+    const decisionCards = document.getElementById("decisionCards");
 
     async function loadLots(){
       const r = await fetch("/monitoring/lots");
@@ -363,6 +379,32 @@ DASHBOARD_HTML = """
         previewImg.src = p.url + "?t=" + Date.now();
         previewPath.textContent = p.url;
       }
+      layerGrid.innerHTML = "";
+      (data.thematic_pngs || []).forEach(item => {
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML = `<img src="${item.url}?t=${Date.now()}" alt="layer"/><div class="meta">${item.url}</div>`;
+        layerGrid.appendChild(card);
+      });
+      const labels = {
+        vigor_vegetal: "Vigor vegetal",
+        estres_hidrico: "Estres hidrico",
+        humedad: "Humedad",
+        enfermedades: "Enfermedades",
+        suelo_desnudo: "Suelo desnudo",
+        malezas: "Malezas",
+        inundaciones: "Inundaciones",
+        salinidad: "Salinidad",
+        quemas: "Quemas",
+        estructura_cultivo: "Estructura del cultivo"
+      };
+      const stats = data.index_stats || {};
+      const summary = data.decision_summary || {};
+      decisionCards.innerHTML = Object.keys(labels).map(k => {
+        const title = labels[k];
+        const v = summary[k] || "n/d";
+        return `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px"><b>${title}:</b> ${v}</div>`;
+      }).join("") + `<pre>${JSON.stringify(stats, null, 2)}</pre>`;
       await loadLots();
     }
 
