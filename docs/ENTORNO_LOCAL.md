@@ -47,7 +47,10 @@ CONFIG_PARTITION_KEY=local
 CONFIG_SORT_KEY=active
 CONFIG_CACHE_TTL_SECONDS=60
 CONFIG_FAIL_FAST=true
+IA_SERVICE_URL=http://agro-ia:8002
 ```
+
+> `IA_SERVICE_URL` va en el TIF porque es el TIF quien llama al Microservicio IA tras procesar el tile.
 
 Contenido mínimo de `microservicio-ia/.env`:
 ```env
@@ -58,7 +61,6 @@ CONFIG_PARTITION_KEY=local
 CONFIG_SORT_KEY=active
 CONFIG_CACHE_TTL_SECONDS=60
 CONFIG_FAIL_FAST=true
-IA_SERVICE_URL=http://agro-ia:8002
 ```
 
 Los valores de `DYNAMODB_ENDPOINT_URL` los inyecta `docker-compose.yml` automáticamente.

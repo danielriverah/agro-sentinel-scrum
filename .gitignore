@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Env files (contienen secretos reales)
+microservicio-tif/.env
+microservicio-ia/.env
+scripts/config-production.json
+
+# Docker
+.docker/
+
+# Temp / IDE
+.idea/
+.vscode/
+*.swp
+*.DS_Store
+
+# Claude Code internals (settings.local.json puede contener tokens OAuth)
+.claude/

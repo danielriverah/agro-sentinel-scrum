@@ -85,7 +85,17 @@ infra: actualizar docker-compose con variable IA_SERVICE_URL
 
 ## Historial de cambios
 
-### v1.0.0 — 2026-05-18
+### v0.2.0 — 2026-05-18 (Sprint 2)
+
+- Estructura completa de `microservicio-tif/` y `microservicio-ia/` creada
+- `docker-compose.yml` con DynamoDB Local + ambos microservicios
+- `GET /health` funcionando en `:8001` y `:8002`
+- `scripts/setup_local_dynamo.sh` y `scripts/config-local.json` para dev local
+- `scripts/test_analyze_request.json` — payload de prueba
+- `docs/ESTRUCTURA_PROYECTO.md` — árbol completo y mapa sprint→módulo
+- Corrección: `IA_SERVICE_URL` pertenece al `.env` de TIF (TIF llama a IA, no al revés)
+
+### v0.1.0 — 2026-05-18 (Sprint 0 — documentación)
 
 - Diseño inicial del sistema
 - Definición de los dos microservicios

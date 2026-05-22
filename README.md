@@ -18,6 +18,7 @@ AgroSentinel es un sistema de análisis satelital agrícola compuesto por **dos 
 ```
 README.md                         ← estás aquí
 docs/ARQUITECTURA.md              ← contratos exactos, reglas, lo que cada servicio NO puede hacer
+docs/ESTRUCTURA_PROYECTO.md       ← árbol completo del repo, propósito de cada archivo, qué sprint lo implementa
 docs/DYNAMODB_CONFIG.md           ← estructura del item de configuración
 docs/ERRORES.md                   ← todos los códigos de error
 docs/GLOSARIO.md                  ← términos agrícolas y técnicos
@@ -34,6 +35,8 @@ PROMPTS_INICIO_SESION.md         ← prompts listos para pegar al inicio de cada
 
 ## Estructura completa del repositorio
 
+> Ver `docs/ESTRUCTURA_PROYECTO.md` para el árbol detallado con propósito de cada archivo.
+
 ```
 agro-sentinel-scrum/
 │
@@ -41,9 +44,12 @@ agro-sentinel-scrum/
 ├── PRODUCT_BACKLOG.md
 ├── DEFINITION_OF_DONE.md
 ├── PROMPTS_INICIO_SESION.md
+├── .gitignore
+├── docker-compose.yml             ← DynamoDB Local :8005 + TIF :8001 + IA :8002
 │
 ├── docs/
 │   ├── ARQUITECTURA.md
+│   ├── ESTRUCTURA_PROYECTO.md     ← árbol completo + qué sprint implementa qué
 │   ├── DYNAMODB_CONFIG.md
 │   ├── ERRORES.md
 │   ├── GLOSARIO.md
@@ -51,6 +57,24 @@ agro-sentinel-scrum/
 │   ├── CONVENCIONES.md
 │   ├── ENTORNO_LOCAL.md
 │   └── SYSTEM_PROMPT_IA.md
+│
+├── scripts/
+│   ├── setup_local_dynamo.sh      ← crea tabla + inserta config local
+│   ├── config-local.json          ← item DynamoDB para desarrollo
+│   └── test_analyze_request.json  ← payload de prueba para POST /analyze
+│
+├── microservicio-tif/             ← Python 3.11 + GDAL, puerto 8001
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── .env.example
+│   └── app/ + tests/
+│
+├── microservicio-ia/              ← Python 3.11 sin GDAL, puerto 8002
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── .env.example
+│   ├── prompts/
+│   └── app/ + tests/
 │
 └── sprints/
     ├── infra/
@@ -101,18 +125,20 @@ Sprint 12    → Integración Laravel
 
 | Sprint | Área | Descripción | Estado |
 |---|---|---|---|
-| 1 | Infra | DynamoDB + S3 + IAM | ⬜ |
-| 2 | Infra | Droplets + Docker + estructura base | ⬜ |
-| 3 | TIF | Esqueleto FastAPI + config loader | ⬜ |
+| 1 | Infra | DynamoDB + S3 + IAM (requiere credenciales AWS) | ⬜ |
+| 2 | Infra | Droplets + Docker + estructura base | ✅ |
+| 3 | TIF | Config loader DynamoDB + caché TTL + /health completo | ⬜ |
 | 4 | TIF | Copernicus auth + búsqueda de escenas | ⬜ |
 | 5 | TIF | Descarga streaming + recorte + máscara SCL | ⬜ |
 | 6 | TIF | Cálculo de índices + estadísticas + PNGs | ⬜ |
 | 7 | TIF | S3 upload + orchestrator + endpoints finales | ⬜ |
-| 8 | IA | Esqueleto FastAPI IA + config | ⬜ |
+| 8 | IA | Esqueleto FastAPI IA + config loader | ⬜ |
 | 9 | IA | Reglas agronómicas + histórico S3 | ⬜ |
 | 10 | IA | Prompt builder + Anthropic + response parser | ⬜ |
 | 11 | IA | Webhook + fallback + auditoría + endpoints | ⬜ |
 | 12 | Laravel | AgroSentinelService + webhook receiver | ⬜ |
+
+> **Sprint 1 puede ejecutarse en paralelo al Sprint 3** — solo requiere acceso a AWS CLI con credenciales. Los Sprints 3–7 usan DynamoDB Local y no necesitan AWS real.
 
 ---
 

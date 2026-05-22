@@ -1,0 +1,18 @@
+{
+  "job_id": "job_01TEST000000001",
+  "lot_id": 1,
+  "polygon_geojson": {
+    "type": "Polygon",
+    "coordinates": [[
+      [-102.2950, 21.8850],
+      [-102.2850, 21.8850],
+      [-102.2850, 21.8780],
+      [-102.2950, 21.8780],
+      [-102.2950, 21.8850]
+    ]]
+  },
+  "dates": ["2026-01-01", "2026-01-31"],
+  "indices": ["NDVI", "NDMI", "NDRE"],
+  "resolution_meters": 20,
+  "force_reprocess": false
+}

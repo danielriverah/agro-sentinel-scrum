@@ -1,0 +1,107 @@
+{
+  "pk": {"S": "local"},
+  "sk": {"S": "active"},
+  "version": {"N": "1"},
+  "enabled": {"BOOL": true},
+  "updated_at": {"S": "2026-05-18T10:00:00Z"},
+  "updated_by": {"S": "dev-setup"},
+
+  "security": {"M": {
+    "api_secret_key": {"S": "dev-secret-123"},
+    "allowed_origins": {"L": [
+      {"S": "http://localhost"},
+      {"S": "http://localhost:8000"}
+    ]}
+  }},
+
+  "ai": {"M": {
+    "provider": {"S": "ollama"},
+    "timeout": {"N": "120"},
+    "max_tokens": {"N": "2500"},
+    "temperature": {"N": "0.2"},
+    "fallback_provider": {"NULL": true},
+    "providers": {"M": {
+      "anthropic": {"M": {
+        "enabled": {"BOOL": false},
+        "api_key": {"S": ""},
+        "model": {"S": "claude-sonnet-4-5"}
+      }},
+      "ollama": {"M": {
+        "enabled": {"BOOL": true},
+        "base_url": {"S": "http://host.docker.internal:11434"},
+        "model": {"S": "qwen2.5:14b"}
+      }}
+    }}
+  }},
+
+  "storage": {"M": {
+    "driver": {"S": "s3"},
+    "aws_region": {"S": "us-east-1"},
+    "s3_bucket": {"S": "agro-sentinel-dev"},
+    "base_path": {"S": "dev"},
+    "public_url_ttl_minutes": {"N": "60"}
+  }},
+
+  "copernicus": {"M": {
+    "client_id": {"S": "COPERNICUS-CLIENT-ID-REAL"},
+    "client_secret": {"S": "COPERNICUS-CLIENT-SECRET-REAL"},
+    "default_collection": {"S": "sentinel-2-l2a"},
+    "max_cloud_coverage": {"N": "30"}
+  }},
+
+  "laravel": {"M": {
+    "webhook_url": {"S": "http://host.docker.internal:8000/api/sentinel/webhook"},
+    "webhook_secret": {"S": "dev-webhook-secret"},
+    "timeout": {"N": "30"}
+  }},
+
+  "data_sources": {"M": {
+    "base_url":        {"S": "http://host.docker.internal:8000"},
+    "api_token":       {"S": ""},
+    "timeout":         {"N": "30"},
+    "sync_on_startup": {"BOOL": false},
+    "endpoints": {"M": {
+      "producciones": {"S": "/api/agro/lotes"},
+      "escenas":      {"S": "/api/agro/escenas"},
+      "cultivos":     {"S": "/api/agro/cultivos"}
+    }}
+  }},
+
+  "processing": {"M": {
+    "default_indices": {"L": [
+      {"S": "NDVI"},
+      {"S": "NDMI"},
+      {"S": "NDRE"}
+    ]},
+    "resolution_meters": {"N": "20"},
+    "apply_cloud_mask": {"BOOL": true},
+    "min_valid_pixels_percentage": {"N": "60"},
+    "generate_png": {"BOOL": true},
+    "generate_geotiff": {"BOOL": true},
+    "generate_pdf": {"BOOL": false}
+  }},
+
+  "agronomic_rules": {"M": {
+    "ndvi_drop_alert_pct": {"N": "15"},
+    "ndmi_drop_alert_pct": {"N": "20"},
+    "ndre_drop_alert_pct": {"N": "15"},
+    "bsi_rise_alert_pct": {"N": "50"},
+    "min_valid_pixels_percentage": {"N": "60"},
+    "risk_levels": {"M": {
+      "low": {"N": "1"},
+      "medium": {"N": "2"},
+      "medium_high": {"N": "3"},
+      "high": {"N": "4"}
+    }}
+  }},
+
+  "crops": {"M": {
+    "maiz": {"M": {
+      "enabled": {"BOOL": true},
+      "ndvi_optimal_min": {"N": "0.65"},
+      "ndvi_warning_min": {"N": "0.45"},
+      "ndmi_warning_min": {"N": "0.20"},
+      "ndre_warning_min": {"N": "0.28"}
+    }}
+  }}
+}
