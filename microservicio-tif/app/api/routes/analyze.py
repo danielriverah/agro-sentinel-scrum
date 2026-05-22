@@ -30,16 +30,13 @@ from app.core.config import (
 )
 from app.models.requests import ProductionSceneRequest, SceneTileRequest
 from app.services.copernicus.scene_assets import SceneAssetsService
-from app.services.crop_config_store import CropConfigStore
-from app.services.monitoring_store import MonitoringStore
 from app.services.processing.scene_tile_builder import SceneTileBuilder
+from app.services.stores import crop_config_store, monitoring_store
 
 router = APIRouter(tags=["analyze"])
 
 scene_assets_service = SceneAssetsService()
 scene_tile_builder = SceneTileBuilder()
-monitoring_store = MonitoringStore()
-crop_config_store = CropConfigStore()
 backfill_jobs: dict[str, dict[str, Any]] = {}
 
 def _mask_value(value: str | None, visible: int = 4) -> str:

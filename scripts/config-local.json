@@ -55,6 +55,18 @@
     "timeout": {"N": "30"}
   }},
 
+  "data_sources": {"M": {
+    "base_url":        {"S": "http://host.docker.internal:8000"},
+    "api_token":       {"S": ""},
+    "timeout":         {"N": "30"},
+    "sync_on_startup": {"BOOL": false},
+    "endpoints": {"M": {
+      "producciones": {"S": "/api/agro/lotes"},
+      "escenas":      {"S": "/api/agro/escenas"},
+      "cultivos":     {"S": "/api/agro/cultivos"}
+    }}
+  }},
+
   "processing": {"M": {
     "default_indices": {"L": [
       {"S": "NDVI"},

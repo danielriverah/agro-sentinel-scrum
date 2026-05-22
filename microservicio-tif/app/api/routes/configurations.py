@@ -5,10 +5,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
-from app.services.crop_config_store import CropConfigStore
+from app.services.stores import crop_config_store as store
 
 router = APIRouter(prefix="/configurations", tags=["configurations"])
-store = CropConfigStore()
 
 
 @router.get("", response_class=HTMLResponse)
