@@ -15,3 +15,7 @@ DYNAMODB_ENDPOINT_URL: str | None = os.getenv("DYNAMODB_ENDPOINT_URL")
 IA_SERVICE_URL: str = os.getenv("IA_SERVICE_URL", "http://agro-ia:8002")
 MONITORING_S3_BUCKET: str | None = os.getenv("MONITORING_S3_BUCKET")
 MONITORING_S3_PREFIX: str = os.getenv("MONITORING_S3_PREFIX", "")
+DYNAMODB_USE_AWS: bool = os.getenv("DYNAMODB_USE_AWS", "false").lower() == "true"
+AWS_ACCESS_KEY_ID_CUSTOM: str | None = os.getenv("AWS_ACCESS_KEY_ID_CUSTOM")
+AWS_SECRET_ACCESS_KEY_CUSTOM: str | None = os.getenv("AWS_SECRET_ACCESS_KEY_CUSTOM")
+AWS_SESSION_TOKEN_CUSTOM: str | None = os.getenv("AWS_SESSION_TOKEN_CUSTOM")

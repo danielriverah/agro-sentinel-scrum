@@ -50,8 +50,9 @@ class ProductionContext(BaseModel):
     semana: int | None = None
     monitoring_s3_key: str | None = None
     monitoring_s3_bucket: str | None = None
+    variedades: str | None = None
 
 
 class ProductionSceneRequest(BaseModel):
-    escene: SceneProductionInput
+    escene: SceneProductionInput | None = None
     production: ProductionContext

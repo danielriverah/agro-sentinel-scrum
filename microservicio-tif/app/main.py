@@ -5,7 +5,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import analyze, health, internal, jobs, lots
+from app.api.routes import analyze, configurations, health, internal, jobs, lots
 from app.services.configuration.config_loader import get_config
 from app.services.configuration.config_validator import validate_tif_config
 
@@ -46,6 +46,7 @@ app.include_router(analyze.router)
 app.include_router(jobs.router)
 app.include_router(lots.router)
 app.include_router(internal.router)
+app.include_router(configurations.router)
 
 outputs_dir = Path("/tmp/agro-tif/outputs")
 outputs_dir.mkdir(parents=True, exist_ok=True)

@@ -22,8 +22,13 @@ def get_config() -> dict[str, Any]:
         return _cache
 
     kwargs: dict[str, Any] = {"region_name": env.AWS_REGION}
-    if env.DYNAMODB_ENDPOINT_URL:
+    if not env.DYNAMODB_USE_AWS and env.DYNAMODB_ENDPOINT_URL:
         kwargs["endpoint_url"] = env.DYNAMODB_ENDPOINT_URL
+    if env.AWS_ACCESS_KEY_ID_CUSTOM and env.AWS_SECRET_ACCESS_KEY_CUSTOM:
+        kwargs["aws_access_key_id"] = env.AWS_ACCESS_KEY_ID_CUSTOM
+        kwargs["aws_secret_access_key"] = env.AWS_SECRET_ACCESS_KEY_CUSTOM
+        if env.AWS_SESSION_TOKEN_CUSTOM:
+            kwargs["aws_session_token"] = env.AWS_SESSION_TOKEN_CUSTOM
 
     try:
         client = boto3.client("dynamodb", **kwargs)
