@@ -27,6 +27,8 @@ from app.core.config import (
     IA_SERVICE_URL,
     MONITORING_S3_BUCKET,
     MONITORING_S3_PREFIX,
+    PRODUCTIONS_API_TOKEN,
+    PRODUCTIONS_API_URL,
 )
 from app.models.requests import ProductionSceneRequest, SceneTileRequest
 from app.services.copernicus.scene_assets import SceneAssetsService
@@ -38,6 +40,32 @@ router = APIRouter(tags=["analyze"])
 scene_assets_service = SceneAssetsService()
 scene_tile_builder = SceneTileBuilder()
 backfill_jobs: dict[str, dict[str, Any]] = {}
+production_locks: dict[int, dict[str, Any]] = {}
+
+
+def _acquire_production_lock(production_id: int, action: str) -> None:
+    active = production_locks.get(production_id)
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "production_locked",
+                "production_id": production_id,
+                "active_action": active.get("action"),
+                "locked_at": active.get("locked_at"),
+                "message": f"Production {production_id} is busy with action '{active.get('action')}'.",
+            },
+        )
+    production_locks[production_id] = {"action": action, "locked_at": datetime.now().isoformat()}
+
+
+def _release_production_lock(production_id: int, action: str | None = None) -> None:
+    active = production_locks.get(production_id)
+    if not active:
+        return
+    if action and active.get("action") != action:
+        return
+    production_locks.pop(production_id, None)
 
 def _mask_value(value: str | None, visible: int = 4) -> str:
     if not value:
@@ -119,6 +147,75 @@ async def import_monitoring_data(payload: dict[str, Any]):
     return {"ok": True, **stats, "total_in_store": len(monitoring_store.productions)}
 
 
+@router.post("/monitoring/import-from-api")
+async def import_monitoring_from_api():
+    if not PRODUCTIONS_API_URL:
+        raise HTTPException(status_code=400, detail="PRODUCTIONS_API_URL is not configured")
+    headers: dict[str, str] = {}
+    if PRODUCTIONS_API_TOKEN:
+        headers["Authorization"] = f"Bearer {PRODUCTIONS_API_TOKEN}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.get(PRODUCTIONS_API_URL, headers=headers)
+        text = resp.text
+        parsed: Any
+        try:
+            parsed = resp.json()
+        except Exception:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "upstream_invalid_json",
+                    "status_code": resp.status_code,
+                    "url": PRODUCTIONS_API_URL,
+                    "body_preview": text[:3000],
+                },
+            )
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "upstream_http_error",
+                    "status_code": resp.status_code,
+                    "url": PRODUCTIONS_API_URL,
+                    "body": parsed,
+                },
+            )
+        if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+            items = parsed.get("items") or []
+        elif isinstance(parsed, list):
+            items = parsed
+            parsed = {"items": items}
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "upstream_unexpected_shape",
+                    "url": PRODUCTIONS_API_URL,
+                    "expected": "{\"items\": [...]} or [...]",
+                    "received_type": type(parsed).__name__,
+                },
+            )
+        stats = monitoring_store.upsert_productions(items)
+        return {
+            "ok": True,
+            "source_url": PRODUCTIONS_API_URL,
+            "import": {**stats, "total_in_store": len(monitoring_store.productions)},
+            "api_response": parsed,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "import_from_api_failed",
+                "url": PRODUCTIONS_API_URL,
+                "message": f"{type(exc).__name__}: {exc}",
+            },
+        ) from exc
+
+
 @router.post("/catalog/scenes/import")
 async def import_scene_catalog(payload: dict[str, Any]):
     items = payload.get("items", [])
@@ -160,6 +257,15 @@ async def output_s3_proxy(path: str):
 
 @router.post("/monitoring/reset")
 async def reset_monitoring_state():
+    if production_locks:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "active_jobs",
+                "message": "Cannot reset while production jobs are running.",
+                "locks": production_locks,
+            },
+        )
     temp_root = Path("/tmp/agro-tif/outputs")
     removed_temp = False
     temp_error = None
@@ -203,6 +309,82 @@ async def list_production_scenes(production_id: int):
     return {"ok": True, "production_id": production_id, "selected_scene": selected, "items": items}
 
 
+@router.get("/monitoring/ia/{production_id}")
+async def get_scene_ia_analysis(production_id: int, scene_name: str | None = None, scene_date: str | None = None):
+    payload = monitoring_store.get_payload(production_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Production not found")
+    target_scene = (scene_name or "").strip()
+    target_date = (scene_date or "").strip()
+
+    scene_items = _list_s3_scenes_for_production(production_id)
+    if not scene_items:
+        return {"ok": True, "production_id": production_id, "has_ia": False, "message": "No scenes found"}
+
+    selected_item = None
+    if target_scene:
+        for x in scene_items:
+            if str(x.get("scene_name") or "") == target_scene and (not target_date or str(x.get("fecha") or "") == target_date):
+                selected_item = x
+                break
+
+    # 1) Try selected scene IA first.
+    if selected_item:
+        scene_base = str(selected_item.get("scene_prefix") or "").rstrip("/")
+        ia_key = f"{scene_base}/multiband.ia.json"
+        ia_payload = _read_json_from_s3_key(ia_key)
+        if ia_payload is not None:
+            stale = _is_analysis_stale(str(ia_payload.get("fecha_analisis") or ""))
+            return {
+                "ok": True,
+                "production_id": production_id,
+                "has_ia": True,
+                "source": "selected_scene",
+                "scene_name": selected_item.get("scene_name"),
+                "scene_date": selected_item.get("fecha"),
+                "ia": ia_payload,
+                "stale": stale,
+                "message": "Analisis IA cargado para la escena seleccionada.",
+            }
+
+    # 2) Fallback to latest available IA in production.
+    with_ia: list[dict[str, Any]] = []
+    for x in sorted(scene_items, key=lambda r: (str(r.get("fecha") or ""), str(r.get("scene_name") or "")), reverse=True):
+        scene_base = str(x.get("scene_prefix") or "").rstrip("/")
+        ia_key = f"{scene_base}/multiband.ia.json"
+        ia_payload = _read_json_from_s3_key(ia_key)
+        if ia_payload is not None:
+            with_ia.append({"item": x, "ia": ia_payload})
+            break
+
+    if with_ia:
+        top = with_ia[0]
+        stale = _is_analysis_stale(str((top.get("ia") or {}).get("fecha_analisis") or ""))
+        msg = "No hay analisis IA para la escena seleccionada; se muestra el ultimo analisis disponible."
+        if stale:
+            msg += " El analisis mostrado esta demasiado antiguo; se sugiere actualizar al dia de hoy."
+        return {
+            "ok": True,
+            "production_id": production_id,
+            "has_ia": True,
+            "source": "latest_fallback",
+            "scene_name": (top.get("item") or {}).get("scene_name"),
+            "scene_date": (top.get("item") or {}).get("fecha"),
+            "ia": top.get("ia"),
+            "stale": stale,
+            "message": msg,
+        }
+
+    return {
+        "ok": True,
+        "production_id": production_id,
+        "has_ia": False,
+        "source": "none",
+        "stale": False,
+        "message": "No existe analisis IA para ninguna escena de la produccion.",
+    }
+
+
 @router.post("/monitoring/scenes/{production_id}/select")
 async def select_production_scene(production_id: int, body: dict[str, Any]):
     payload = monitoring_store.get_payload(production_id)
@@ -219,28 +401,43 @@ async def select_production_scene(production_id: int, body: dict[str, Any]):
     scene = _scene_from_s3_record(record, ProductionSceneRequest(production=production_ctx))
     payload["escene"] = scene.model_dump()
     monitoring_store.productions[production_id] = payload
-    return {"ok": True, "production_id": production_id, "scene": payload["escene"]}
+    pruned_prod = _prune_runtime_for_production(production_id)
+    pruned_scene = _prune_runtime_for_scene(production_id, scene_name)
+    return {
+        "ok": True,
+        "production_id": production_id,
+        "scene": payload["escene"],
+        "pruned": {
+            "production": pruned_prod,
+            "scene": pruned_scene,
+        },
+    }
 
 
 @router.post("/monitoring/analyze/{production_id}")
 async def analyze_monitored_lot(production_id: int):
-    payload = monitoring_store.get_payload(production_id)
-    if not payload:
-        raise HTTPException(status_code=404, detail="Production not found")
-    typed_payload = ProductionSceneRequest(**payload)
-    result = await _run_production_analysis(typed_payload)
-    serialized = _serialize_result(result, typed_payload)
-    # Keep explicit "normal/truth" image sets for UI toggle.
-    if not serialized.get("truth_preview_pngs"):
-        serialized["truth_preview_pngs"] = serialized.get("preview_pngs", [])
-    if not serialized.get("truth_thematic_pngs"):
-        serialized["truth_thematic_pngs"] = serialized.get("thematic_pngs", [])
-    monitoring_store.save_analysis(production_id, serialized)
-    return serialized
+    _acquire_production_lock(production_id, "analyze_single")
+    try:
+        payload = monitoring_store.get_payload(production_id)
+        if not payload:
+            raise HTTPException(status_code=404, detail="Production not found")
+        typed_payload = ProductionSceneRequest(**payload)
+        result = await _run_production_analysis(typed_payload)
+        serialized = _serialize_result(result, typed_payload)
+        # Keep explicit "normal/truth" image sets for UI toggle.
+        if not serialized.get("truth_preview_pngs"):
+            serialized["truth_preview_pngs"] = serialized.get("preview_pngs", [])
+        if not serialized.get("truth_thematic_pngs"):
+            serialized["truth_thematic_pngs"] = serialized.get("thematic_pngs", [])
+        monitoring_store.save_analysis(production_id, serialized)
+        return serialized
+    finally:
+        _release_production_lock(production_id, "analyze_single")
 
 
 @router.post("/monitoring/upload/{production_id}")
 async def upload_monitored_lot_to_s3(production_id: int):
+    _acquire_production_lock(production_id, "upload")
     try:
         if not MONITORING_S3_BUCKET:
             raise HTTPException(status_code=400, detail="MONITORING_S3_BUCKET is not configured")
@@ -429,6 +626,8 @@ async def upload_monitored_lot_to_s3(production_id: int):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"S3 upload failed: {exc}") from exc
+    finally:
+        _release_production_lock(production_id, "upload")
 
 
 @router.post("/monitoring/backfill/{production_id}")
@@ -439,6 +638,7 @@ async def backfill_production_scenes(production_id: int, body: dict[str, Any] | 
 
 @router.post("/monitoring/backfill/start/{production_id}")
 async def start_backfill_production_scenes(production_id: int, body: dict[str, Any] | None = None):
+    _acquire_production_lock(production_id, "backfill")
     force = bool((body or {}).get("force", False))
     job_id = f"bf_{production_id}_{int(datetime.now().timestamp() * 1000)}"
     backfill_jobs[job_id] = {
@@ -480,6 +680,8 @@ async def start_backfill_production_scenes(production_id: int, body: dict[str, A
             job["error"] = f"{type(exc).__name__}: {exc}"
             job["finished_at"] = datetime.now().isoformat()
             backfill_jobs[job_id] = job
+        finally:
+            _release_production_lock(production_id, "backfill")
 
     asyncio.create_task(_bg())
     return {"ok": True, "job_id": job_id, "production_id": production_id, "force": force}
@@ -750,116 +952,124 @@ def _set_backfill_phase_progress(job_id: str, prepared_done: int | None, uploade
 
 @router.post("/monitoring/ia/preview/{production_id}")
 async def preview_ai_analysis(production_id: int):
-    if not MONITORING_S3_BUCKET:
-        raise HTTPException(status_code=400, detail="MONITORING_S3_BUCKET is not configured")
-    payload = monitoring_store.get_payload(production_id)
-    if not payload:
-        raise HTTPException(status_code=404, detail="Production not found")
+    _acquire_production_lock(production_id, "ia_preview")
+    try:
+        if not MONITORING_S3_BUCKET:
+            raise HTTPException(status_code=400, detail="MONITORING_S3_BUCKET is not configured")
+        payload = monitoring_store.get_payload(production_id)
+        if not payload:
+            raise HTTPException(status_code=404, detail="Production not found")
 
-    scene = payload.get("escene") or {}
-    scene_name = str(scene.get("scene_name") or "").strip()
-    scene_date = str(scene.get("fecha") or "").strip()
-    if not scene_name or not scene_date:
-        raise HTTPException(status_code=400, detail="Scene selection is required (scene_name + fecha)")
+        scene = payload.get("escene") or {}
+        scene_name = str(scene.get("scene_name") or "").strip()
+        scene_date = str(scene.get("fecha") or "").strip()
+        if not scene_name or not scene_date:
+            raise HTTPException(status_code=400, detail="Scene selection is required (scene_name + fecha)")
 
-    current_params = _load_params_for_scene(production_id, scene_name)
-    if current_params is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Current params not found: PROD_{production_id}/{scene_name}/multiband.params.json",
+        current_params = _load_params_for_scene(production_id, scene_name)
+        if current_params is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Current params not found: PROD_{production_id}/{scene_name}/multiband.params.json",
+            )
+
+        previous_scene = _load_previous_scene_record_from_s3(
+            production_id=production_id,
+            current_scene_name=scene_name,
+            current_date=scene_date,
+        )
+        previous_params = _load_params_from_scene_record(previous_scene) if previous_scene else None
+
+        production = payload.get("production") or {}
+        ia_input_payload = _build_ai_input_payload(
+            production=production,
+            current_params=current_params,
+            previous_params=previous_params,
+        )
+        try:
+            async with httpx.AsyncClient(timeout=80.0) as client:
+                ia_resp = await client.post(
+                    f"{IA_SERVICE_URL.rstrip('/')}/analyze",
+                    json={"payload": ia_input_payload},
+                )
+                ia_data = ia_resp.json()
+                if ia_resp.status_code >= 400:
+                    detail = ia_data.get("detail") if isinstance(ia_data, dict) else ia_data
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": "ia_service_error",
+                            "status_code": ia_resp.status_code,
+                            "detail": detail,
+                        },
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"IA service request failed: {type(exc).__name__}: {exc}") from exc
+
+        ia_compact = ia_data if isinstance(ia_data, dict) else {}
+        ia_payload = _build_ai_output_payload(
+            production=production,
+            current_params=current_params,
+            compact=ia_compact,
         )
 
-    previous_scene = _load_previous_scene_record_from_s3(
-        production_id=production_id,
-        current_scene_name=scene_name,
-        current_date=scene_date,
-    )
-    previous_params = _load_params_from_scene_record(previous_scene) if previous_scene else None
-
-    production = payload.get("production") or {}
-    ia_input_payload = _build_ai_input_payload(
-        production=production,
-        current_params=current_params,
-        previous_params=previous_params,
-    )
-    try:
-        async with httpx.AsyncClient(timeout=80.0) as client:
-            ia_resp = await client.post(
-                f"{IA_SERVICE_URL.rstrip('/')}/analyze",
-                json={"payload": ia_input_payload},
-            )
-            ia_data = ia_resp.json()
-            if ia_resp.status_code >= 400:
-                detail = ia_data.get("detail") if isinstance(ia_data, dict) else ia_data
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "error": "ia_service_error",
-                        "status_code": ia_resp.status_code,
-                        "detail": detail,
-                    },
-                )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"IA service request failed: {type(exc).__name__}: {exc}") from exc
-
-    ia_compact = ia_data if isinstance(ia_data, dict) else {}
-    ia_payload = _build_ai_output_payload(
-        production=production,
-        current_params=current_params,
-        compact=ia_compact,
-    )
-
-    analysis = monitoring_store.get_analysis_result(production_id) or {}
-    analysis["ia_preview"] = ia_payload
-    if monitoring_store.get_analysis_result(production_id):
-        monitoring_store.update_analysis_result(production_id, analysis)
-    else:
-        monitoring_store.analyses[production_id] = {
-            "ndvi": None,
-            "trend": None,
-            "risk": "pendiente",
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "result": analysis,
+        analysis = monitoring_store.get_analysis_result(production_id) or {}
+        analysis["ia_preview"] = ia_payload
+        if monitoring_store.get_analysis_result(production_id):
+            monitoring_store.update_analysis_result(production_id, analysis)
+        else:
+            monitoring_store.analyses[production_id] = {
+                "ndvi": None,
+                "trend": None,
+                "risk": "pendiente",
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "result": analysis,
+            }
+        return {
+            "ok": True,
+            "production_id": production_id,
+            "scene_name": scene_name,
+            "ia_input": ia_input_payload,
+            "ia_compact": ia_compact,
+            "ia_preview": ia_payload,
         }
-    return {
-        "ok": True,
-        "production_id": production_id,
-        "scene_name": scene_name,
-        "ia_input": ia_input_payload,
-        "ia_compact": ia_compact,
-        "ia_preview": ia_payload,
-    }
+    finally:
+        _release_production_lock(production_id, "ia_preview")
 
 
 @router.post("/monitoring/ia/save/{production_id}")
 async def save_ai_analysis_to_s3(production_id: int):
-    if not MONITORING_S3_BUCKET:
-        raise HTTPException(status_code=400, detail="MONITORING_S3_BUCKET is not configured")
-    payload = monitoring_store.get_payload(production_id)
-    if not payload:
-        raise HTTPException(status_code=404, detail="Production not found")
+    _acquire_production_lock(production_id, "ia_save")
+    try:
+        if not MONITORING_S3_BUCKET:
+            raise HTTPException(status_code=400, detail="MONITORING_S3_BUCKET is not configured")
+        payload = monitoring_store.get_payload(production_id)
+        if not payload:
+            raise HTTPException(status_code=404, detail="Production not found")
 
-    scene = payload.get("escene") or {}
-    scene_name = str(scene.get("scene_name") or "").strip()
-    if not scene_name:
-        raise HTTPException(status_code=400, detail="Scene selection is required")
+        scene = payload.get("escene") or {}
+        scene_name = str(scene.get("scene_name") or "").strip()
+        if not scene_name:
+            raise HTTPException(status_code=400, detail="Scene selection is required")
 
-    analysis = monitoring_store.get_analysis_result(production_id) or {}
-    ia_payload = analysis.get("ia_preview")
-    if not isinstance(ia_payload, dict):
-        raise HTTPException(status_code=409, detail="No IA preview available. Generate preview first.")
+        analysis = monitoring_store.get_analysis_result(production_id) or {}
+        ia_payload = analysis.get("ia_preview")
+        if not isinstance(ia_payload, dict):
+            raise HTTPException(status_code=409, detail="No IA preview available. Generate preview first.")
 
-    base_prefix = MONITORING_S3_PREFIX.strip("/")
-    ia_key = f"{base_prefix + '/' if base_prefix else ''}PROD_{production_id}/{scene_name}/multiband.ia.json"
-    s3_client.put_object(
-        Bucket=MONITORING_S3_BUCKET,
-        Key=ia_key,
-        Body=json.dumps(ia_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-        ContentType="application/json",
-    )
-    return {"ok": True, "production_id": production_id, "scene_name": scene_name, "ia_key": ia_key, "ia_uri": f"s3://{MONITORING_S3_BUCKET}/{ia_key}"}
+        base_prefix = MONITORING_S3_PREFIX.strip("/")
+        ia_key = f"{base_prefix + '/' if base_prefix else ''}PROD_{production_id}/{scene_name}/multiband.ia.json"
+        s3_client.put_object(
+            Bucket=MONITORING_S3_BUCKET,
+            Key=ia_key,
+            Body=json.dumps(ia_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        return {"ok": True, "production_id": production_id, "scene_name": scene_name, "ia_key": ia_key, "ia_uri": f"s3://{MONITORING_S3_BUCKET}/{ia_key}"}
+    finally:
+        _release_production_lock(production_id, "ia_save")
 
 
 @router.get("/monitoring/status/{production_id}")
@@ -880,83 +1090,85 @@ async def monitoring_status(production_id: int):
 
 @router.post("/monitoring/render/{production_id}")
 async def render_uploaded_tif(production_id: int):
-    if not MONITORING_S3_BUCKET:
-        raise HTTPException(status_code=400, detail="MONITORING_S3_BUCKET is not configured")
-    analysis = monitoring_store.get_analysis_result(production_id)
-    payload = monitoring_store.get_payload(production_id)
-    if not analysis or not payload:
-        raise HTTPException(status_code=404, detail="No analysis found for production")
-    truth = str(analysis.get("truth_tif_path") or "")
-    if not truth.startswith("s3://"):
-        raise HTTPException(status_code=400, detail="Upload base TIF to S3 first")
-    expected_bands = len((payload.get("escene", {}) or {}).get("bands") or ["B04", "B03", "B02", "B08", "B05", "B06", "B07", "B8A", "B11", "B12"])
-    existing_render = str(analysis.get("render_tif_path") or "")
+    _acquire_production_lock(production_id, "render")
+    try:
+        if not MONITORING_S3_BUCKET:
+            raise HTTPException(status_code=400, detail="MONITORING_S3_BUCKET is not configured")
+        analysis = monitoring_store.get_analysis_result(production_id)
+        payload = monitoring_store.get_payload(production_id)
+        if not analysis or not payload:
+            raise HTTPException(status_code=404, detail="No analysis found for production")
+        truth = str(analysis.get("truth_tif_path") or "")
+        if not truth.startswith("s3://"):
+            raise HTTPException(status_code=400, detail="Upload base TIF to S3 first")
+        expected_bands = len((payload.get("escene", {}) or {}).get("bands") or ["B04", "B03", "B02", "B08", "B05", "B06", "B07", "B8A", "B11", "B12"])
+        existing_render = str(analysis.get("render_tif_path") or "")
 
-    scene_name = payload.get("escene", {}).get("scene_name") or analysis.get("scene_name") or "unknown_scene"
-    base_prefix = MONITORING_S3_PREFIX.strip("/")
-    base_key = f"{base_prefix + '/' if base_prefix else ''}PROD_{production_id}/{scene_name}"
+        scene_name = payload.get("escene", {}).get("scene_name") or analysis.get("scene_name") or "unknown_scene"
+        base_prefix = MONITORING_S3_PREFIX.strip("/")
+        base_key = f"{base_prefix + '/' if base_prefix else ''}PROD_{production_id}/{scene_name}"
 
-    folder_assets = _load_scene_assets_from_s3_prefix(production_id=production_id, scene_name=scene_name)
-    # This endpoint no longer creates rendered.tif. It only generates rendered PNGs
-    # from an externally provided/rendered multiband_tif if available.
-    render_path = ""
-    if existing_render.startswith("s3://"):
-        render_path = existing_render
-    elif folder_assets and folder_assets.get("render_tif_path"):
-        render_path = str(folder_assets["render_tif_path"])
+        folder_assets = _load_scene_assets_from_s3_prefix(production_id=production_id, scene_name=scene_name)
+        render_path = ""
+        if existing_render.startswith("s3://"):
+            render_path = existing_render
+        elif folder_assets and folder_assets.get("render_tif_path"):
+            render_path = str(folder_assets["render_tif_path"])
 
-    if not render_path:
-        raise HTTPException(
-            status_code=400,
-            detail="No rendered TIF found. Upload external multiband_rendered.tif first.",
+        if not render_path:
+            raise HTTPException(
+                status_code=400,
+                detail="No rendered TIF found. Upload external multiband_rendered.tif first.",
+            )
+
+        band_count = _tif_band_count(render_path, production_id, "external_render")
+        if band_count < expected_bands:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Rendered TIF has {band_count} bands; expected at least {expected_bands}.",
+            )
+
+        existing_render_previews = (analysis.get("render_preview_pngs") or [])
+        existing_render_thematics = (analysis.get("render_thematic_pngs") or [])
+        if existing_render_previews and existing_render_thematics:
+            return {"ok": True, "already_rendered": True, "render_tif_path": render_path}
+
+        local_render = _download_s3_tif_to_local(render_path, production_id, scene_name)
+        bands = (payload.get("escene", {}) or {}).get("bands") or ["B04", "B03", "B02", "B08", "B05", "B06", "B07", "B8A", "B11", "B12"]
+        polygon_source = payload.get("production", {}).get("poligono_asig") or payload.get("production", {}).get("poligono_zona")
+        polygon_geojson = _polygon_str_to_geojson(polygon_source) if polygon_source else None
+        rendered = scene_tile_builder.build_from_multiband_tif(
+            scene_name=scene_name,
+            tile_size=int((payload.get("escene", {}) or {}).get("tile_size") or 256),
+            multiband_tif_path=local_render,
+            bands=bands,
+            polygon_geojson=polygon_geojson,
+            production_id=production_id,
         )
 
-    band_count = _tif_band_count(render_path, production_id, "external_render")
-    if band_count < expected_bands:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Rendered TIF has {band_count} bands; expected at least {expected_bands}.",
-        )
+        render_preview_pngs: list[dict[str, str]] = []
+        for p in rendered.get("pngs", []):
+            local_png = str(p)
+            filename = Path(local_png).name.replace(".png", "_render.png")
+            key = f"{base_key}/{filename}"
+            s3_client.upload_file(local_png, MONITORING_S3_BUCKET, key, ExtraArgs={"ContentType": "image/png"})
+            render_preview_pngs.append({"path": f"s3://{MONITORING_S3_BUCKET}/{key}", "url": f"s3://{MONITORING_S3_BUCKET}/{key}"})
 
-    existing_render_previews = (analysis.get("render_preview_pngs") or [])
-    existing_render_thematics = (analysis.get("render_thematic_pngs") or [])
-    if existing_render_previews and existing_render_thematics:
-        return {"ok": True, "already_rendered": True, "render_tif_path": render_path}
+        render_thematic_pngs: list[dict[str, str]] = []
+        for p in rendered.get("thematic_pngs", []):
+            local_png = str(p)
+            filename = Path(local_png).name.replace(".png", "_render.png")
+            key = f"{base_key}/{filename}"
+            s3_client.upload_file(local_png, MONITORING_S3_BUCKET, key, ExtraArgs={"ContentType": "image/png"})
+            render_thematic_pngs.append({"path": f"s3://{MONITORING_S3_BUCKET}/{key}", "url": f"s3://{MONITORING_S3_BUCKET}/{key}"})
 
-    local_render = _download_s3_tif_to_local(render_path, production_id, scene_name)
-    bands = (payload.get("escene", {}) or {}).get("bands") or ["B04", "B03", "B02", "B08", "B05", "B06", "B07", "B8A", "B11", "B12"]
-    polygon_source = payload.get("production", {}).get("poligono_asig") or payload.get("production", {}).get("poligono_zona")
-    polygon_geojson = _polygon_str_to_geojson(polygon_source) if polygon_source else None
-    rendered = scene_tile_builder.build_from_multiband_tif(
-        scene_name=scene_name,
-        tile_size=int((payload.get("escene", {}) or {}).get("tile_size") or 256),
-        multiband_tif_path=local_render,
-        bands=bands,
-        polygon_geojson=polygon_geojson,
-        production_id=production_id,
-    )
-
-    render_preview_pngs: list[dict[str, str]] = []
-    for p in rendered.get("pngs", []):
-        local_png = str(p)
-        filename = Path(local_png).name.replace(".png", "_render.png")
-        key = f"{base_key}/{filename}"
-        s3_client.upload_file(local_png, MONITORING_S3_BUCKET, key, ExtraArgs={"ContentType": "image/png"})
-        render_preview_pngs.append({"path": f"s3://{MONITORING_S3_BUCKET}/{key}", "url": f"s3://{MONITORING_S3_BUCKET}/{key}"})
-
-    render_thematic_pngs: list[dict[str, str]] = []
-    for p in rendered.get("thematic_pngs", []):
-        local_png = str(p)
-        filename = Path(local_png).name.replace(".png", "_render.png")
-        key = f"{base_key}/{filename}"
-        s3_client.upload_file(local_png, MONITORING_S3_BUCKET, key, ExtraArgs={"ContentType": "image/png"})
-        render_thematic_pngs.append({"path": f"s3://{MONITORING_S3_BUCKET}/{key}", "url": f"s3://{MONITORING_S3_BUCKET}/{key}"})
-
-    analysis["render_tif_path"] = render_path
-    analysis["render_preview_pngs"] = render_preview_pngs
-    analysis["render_thematic_pngs"] = render_thematic_pngs
-    monitoring_store.update_analysis_result(production_id, analysis)
-    return {"ok": True, "render_tif_path": render_path, "generated_render_pngs": True}
+        analysis["render_tif_path"] = render_path
+        analysis["render_preview_pngs"] = render_preview_pngs
+        analysis["render_thematic_pngs"] = render_thematic_pngs
+        monitoring_store.update_analysis_result(production_id, analysis)
+        return {"ok": True, "render_tif_path": render_path, "generated_render_pngs": True}
+    finally:
+        _release_production_lock(production_id, "render")
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -2052,6 +2264,7 @@ def _list_s3_scenes_for_production(production_id: int) -> list[dict[str, Any]]:
             scene_prefix = key.rsplit("/", 1)[0] + "/"
             truth_key = f"{scene_prefix}multiband.tif"
             render_key = f"{scene_prefix}multiband_rendered.tif"
+            ia_key = f"{scene_prefix}multiband.ia.json"
             id_key = f"{scene_date}::{scene_name}"
             out[id_key] = {
                 "scene_name": scene_name,
@@ -2060,6 +2273,7 @@ def _list_s3_scenes_for_production(production_id: int) -> list[dict[str, Any]]:
                 "scene_prefix": scene_prefix,
                 "truth_tif_exists": _s3_key_exists(truth_key),
                 "render_tif_exists": _s3_key_exists(render_key),
+                "ia_exists": _s3_key_exists(ia_key),
             }
     items = list(out.values())
     items.sort(key=lambda x: (x.get("fecha") or "", x.get("scene_name") or ""), reverse=True)
@@ -2098,6 +2312,88 @@ def _replace_band_suffix(url: str, band_code: str) -> str:
     # Example:
     # .../S2B_14QKJ_20260418_0_L2A/B04.tif -> .../B11.tif
     return re.sub(r"/B(?:0[2-9]|1[0-2]|8A)\.tif$", f"/{band_code}.tif", url)
+
+
+def _read_json_from_s3_key(key: str) -> dict[str, Any] | None:
+    if not MONITORING_S3_BUCKET:
+        return None
+    try:
+        obj = s3_client.get_object(Bucket=MONITORING_S3_BUCKET, Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _is_analysis_stale(fecha_analisis: str, max_days: int = 14) -> bool:
+    try:
+        fa = datetime.strptime(fecha_analisis, "%Y-%m-%d").date()
+        now = datetime.now().date()
+        return (now - fa).days > max_days
+    except Exception:
+        return True
+
+
+def _prune_runtime_for_production(keep_production_id: int) -> dict[str, int]:
+    removed_dirs = 0
+    removed_tmp_imgs = 0
+    dropped_analyses = 0
+    dropped_scene_caches = 0
+
+    # 1) Drop in-memory heavy caches from non-selected productions.
+    for pid in list(monitoring_store.analyses.keys()):
+        if int(pid) != int(keep_production_id):
+            monitoring_store.analyses.pop(pid, None)
+            dropped_analyses += 1
+    for pid in list(monitoring_store.scenes_cache.keys()):
+        if int(pid) != int(keep_production_id):
+            monitoring_store.scenes_cache.pop(pid, None)
+            dropped_scene_caches += 1
+
+    # 2) Keep only /tmp outputs for selected production.
+    root = Path("/tmp/agro-tif/outputs")
+    if root.exists():
+        for child in root.iterdir():
+            name = child.name
+            if child.is_dir() and name.startswith("PROD_"):
+                if name != f"PROD_{keep_production_id}":
+                    try:
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed_dirs += 1
+                    except Exception:
+                        pass
+            elif child.is_file() and name.startswith("tmp_img_"):
+                # tmp_img_{production_id}_*.png
+                if not name.startswith(f"tmp_img_{keep_production_id}_"):
+                    try:
+                        child.unlink(missing_ok=True)
+                        removed_tmp_imgs += 1
+                    except Exception:
+                        pass
+
+    return {
+        "removed_dirs": removed_dirs,
+        "removed_tmp_imgs": removed_tmp_imgs,
+        "dropped_analyses": dropped_analyses,
+        "dropped_scene_caches": dropped_scene_caches,
+    }
+
+
+def _prune_runtime_for_scene(production_id: int, keep_scene_name: str) -> dict[str, int]:
+    removed_scene_dirs = 0
+    root = Path(f"/tmp/agro-tif/outputs/PROD_{production_id}")
+    if not root.exists():
+        return {"removed_scene_dirs": removed_scene_dirs}
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        # Keep only selected scene directory
+        if child.name != keep_scene_name:
+            try:
+                shutil.rmtree(child, ignore_errors=True)
+                removed_scene_dirs += 1
+            except Exception:
+                pass
+    return {"removed_scene_dirs": removed_scene_dirs}
 
 
 def _scene_from_s3_record(record: dict[str, Any], payload: ProductionSceneRequest):
@@ -2296,14 +2592,9 @@ DASHBOARD_HTML = """
           </table>
         </section>
         <section class="card">
-          <h3 style="margin-top:0">Importar producciones</h3>
-          <p class="tiny">Pega JSON: {"items":[{escene:{...},production:{...}}]}</p>
-          <textarea id="jsonInput"></textarea>
-          <button class="btn" id="importBtn" style="margin-top:10px">Cargar producciones</button>
-          <p class="tiny">Catalogo de escenas: {"items":[{"scene_name":"...","tif_render_path":"...","tif_truth_path":"...","preview_pngs":["..."]}]}</p>
-          <textarea id="catalogInput"></textarea>
-          <button class="btn" id="catalogBtn" style="margin-top:10px">Cargar catalogo escenas</button>
-          <p class="tiny" id="importStatus"></p>
+          <h3 style="margin-top:0">Sincronizacion</h3>
+          <p class="tiny">Las producciones y escenas se cargan automaticamente desde la URL configurada del sistema.</p>
+          <p class="tiny">Usa el boton <b>Actualizar</b> para volver a consultar la fuente remota y ver su respuesta.</p>
         </section>
       </div>
       <div class="layout" style="margin-top:16px">
@@ -2316,6 +2607,9 @@ DASHBOARD_HTML = """
         <section class="card">
           <h3 style="margin-top:0">Respuesta analisis</h3>
           <textarea id="analysisOutput" readonly></textarea>
+          <h3 style="margin-top:12px">Analisis IA</h3>
+          <div id="iaStatus" class="tiny">Selecciona una escena para cargar análisis IA.</div>
+          <div id="iaPanel" class="tiny" style="margin-top:8px"></div>
         </section>
       </div>
       <div class="layout" style="margin-top:16px">
@@ -2339,7 +2633,6 @@ DASHBOARD_HTML = """
   </div>
   <script>
     const rowsEl = document.getElementById("lotsRows");
-    const importStatus = document.getElementById("importStatus");
     const output = document.getElementById("analysisOutput");
     const previewImg = document.getElementById("previewImg");
     const previewPath = document.getElementById("previewPath");
@@ -2360,12 +2653,18 @@ DASHBOARD_HTML = """
     const aiSaveBtn = document.getElementById("aiSaveBtn");
     const backfillProgressBar = document.getElementById("backfillProgressBar");
     const backfillProgressText = document.getElementById("backfillProgressText");
+    const iaStatus = document.getElementById("iaStatus");
+    const iaPanel = document.getElementById("iaPanel");
     let backfillPollTimer = null;
+    const SESSION_PRODUCTIONS_KEY = "agro_monitoring_items_v1";
+    const SESSION_SCENES_KEY = "agro_scene_catalog_items_v1";
     let selectedProductionId = null;
     let selectedRowEl = null;
     let lastAnalysis = null;
+    let hasIaPreviewReady = false;
     let currentLayerMap = {};
     let currentLayerKey = "natural";
+    let uiBusyMode = "idle";
 
     const LAYER_ORDER = ["natural","false_color_veg","red_edge","swir","ndvi","ndre","ndmi","savi","evi","gndvi","nbr"];
     const LAYER_LABELS = {
@@ -2394,6 +2693,44 @@ DASHBOARD_HTML = """
       gndvi: "GNDVI: vigor usando banda verde; útil para estimar actividad fotosintética.",
       nbr: "NBR: contraste vegetación vs áreas secas/afectadas; valores bajos pueden indicar estrés o quemas.",
     };
+
+    const BUSY_LABELS = {
+      idle: "Listo",
+      refresh: "Actualizando producciones",
+      analyze_single: "Creando/actualizando TIF",
+      backfill: "Generando todas las faltantes",
+      upload: "Subiendo TIF y artefactos",
+      render: "Generando imágenes render",
+      ia_preview: "Generando análisis IA",
+      ia_save: "Guardando análisis IA",
+      reset: "Limpiando cache y temporales",
+      scene_select: "Cargando escena",
+    };
+
+    function isUiBusy(){
+      return uiBusyMode !== "idle";
+    }
+
+    function setUiBusy(mode){
+      uiBusyMode = mode || "idle";
+      const busy = isUiBusy();
+      const lockAll = busy;
+      analyzeBtn.disabled = lockAll || !selectedProductionId;
+      backfillBtn.disabled = lockAll || !selectedProductionId;
+      uploadBtn.disabled = lockAll || !selectedProductionId;
+      renderBtn.disabled = lockAll || !selectedProductionId;
+      aiPreviewBtn.disabled = lockAll || !selectedProductionId;
+      aiSaveBtn.disabled = lockAll || !selectedProductionId || !hasIaPreviewReady;
+      resetBtn.disabled = lockAll;
+      reloadScenesBtn.disabled = lockAll || !selectedProductionId;
+      sceneSelect.disabled = lockAll || !selectedProductionId;
+      document.getElementById("refreshBtn").disabled = lockAll;
+      const rows = rowsEl.querySelectorAll("tr.clickable-row");
+      rows.forEach(r => { r.style.pointerEvents = lockAll ? "none" : "auto"; r.style.opacity = lockAll ? "0.65" : "1"; });
+      if(busy){
+        selectionStatus.textContent = `Sistema ocupado: ${BUSY_LABELS[uiBusyMode] || uiBusyMode}. Espera a que termine para evitar conflictos.`;
+      }
+    }
 
     function detectLayerKeyFromUrl(url){
       const clean = (url || "").split("?")[0].toLowerCase();
@@ -2477,7 +2814,8 @@ DASHBOARD_HTML = """
     function sceneOptionText(x){
       const truth = x.truth_tif_exists ? "TIF" : "sin TIF";
       const rend = x.render_tif_exists ? "render" : "sin render";
-      return `${x.fecha} | ${x.scene_name} | ${truth} | ${rend}`;
+      const ia = x.ia_exists ? "IA" : "sin IA";
+      return `${x.fecha} | ${x.scene_name} | ${truth} | ${rend} | ${ia}`;
     }
 
     function refreshSelectedSceneOptionLabel(){
@@ -2485,13 +2823,64 @@ DASHBOARD_HTML = """
       const opt = sceneSelect.options[sceneSelect.selectedIndex];
       const truth = opt.dataset.truth === "1";
       const render = opt.dataset.render === "1";
+      const ia = opt.dataset.ia === "1";
       const date = opt.dataset.sceneDate || "-";
       const name = opt.value || "-";
-      opt.textContent = `${date} | ${name} | ${truth ? "TIF" : "sin TIF"} | ${render ? "render" : "sin render"}`;
+      opt.textContent = `${date} | ${name} | ${truth ? "TIF" : "sin TIF"} | ${render ? "render" : "sin render"} | ${ia ? "IA" : "sin IA"}`;
+    }
+
+    function renderIaPanelFromPayload(ia, stale, sourceLabel, message){
+      const hall = Array.isArray(ia.hallazgos) ? ia.hallazgos : [];
+      const recs = Array.isArray(ia.recomendaciones) ? ia.recomendaciones : [];
+      const hallHtml = hall.map(h => `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px"><b>${h.tipo || "hallazgo"}</b> | zona: ${h.zona || "general"} | severidad: ${h.severidad || "baja"}<br/>${h.descripcion || ""}</div>`).join("");
+      const recHtml = recs.map(r => `<li>${r}</li>`).join("");
+      const staleHtml = stale ? `<div style="padding:8px;border:1px solid #7a5a24;border-radius:8px;background:#3b2d16;color:#ffdba1;margin-bottom:8px">Este análisis está demasiado antiguo. Se sugiere actualizar el análisis al día de hoy (${new Date().toISOString().slice(0,10)}).</div>` : "";
+      iaStatus.textContent = `${message || "Análisis IA cargado"}${sourceLabel ? ` (fuente: ${sourceLabel})` : ""}`;
+      iaPanel.innerHTML = `
+        ${staleHtml}
+        <div style="padding:8px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px">
+          <b>Estado general:</b> ${ia.estado_general || "n/d"}<br/>
+          <b>Riesgo:</b> ${(ia.riesgo || {}).nivel || "n/d"} - ${(ia.riesgo || {}).motivo || ""}
+        </div>
+        <div style="padding:8px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px"><b>Resumen:</b><br/>${ia.resumen || "Sin resumen"}</div>
+        <div><b>Hallazgos</b></div>
+        ${hallHtml || "<div class='tiny'>Sin hallazgos.</div>"}
+        <div style="margin-top:8px"><b>Recomendaciones</b></div>
+        ${recHtml ? `<ol>${recHtml}</ol>` : "<div class='tiny'>Sin recomendaciones.</div>"}
+      `;
+    }
+
+    async function loadIaForSelection(productionId){
+      if(!productionId || !sceneSelect || sceneSelect.selectedIndex < 0){ return; }
+      const selected = sceneSelect.options[sceneSelect.selectedIndex];
+      const sceneName = selected.value;
+      const sceneDate = selected.dataset.sceneDate || "";
+      iaStatus.textContent = "Cargando análisis IA...";
+      iaPanel.innerHTML = "";
+      try{
+        const r = await fetch(`/monitoring/ia/${productionId}?scene_name=${encodeURIComponent(sceneName)}&scene_date=${encodeURIComponent(sceneDate)}`);
+        const data = await r.json().catch(() => ({}));
+        if(!r.ok){
+          iaStatus.textContent = data.detail || "No se pudo cargar análisis IA.";
+          return;
+        }
+        if(!data.has_ia){
+          iaStatus.textContent = "No existe análisis IA para esta producción.";
+          return;
+        }
+        const ia = data.ia || {};
+        const stale = !!data.stale;
+        const source = data.source === "latest_fallback" ? "ultimo disponible" : "escena seleccionada";
+        renderIaPanelFromPayload(ia, stale, source, data.message || "Análisis IA cargado");
+      }catch(e){
+        iaStatus.textContent = "Error cargando análisis IA.";
+      }
     }
 
     async function selectSceneForProduction(productionId, sceneName, sceneDate){
+      if(isUiBusy()){ return; }
       if(!sceneName){ return; }
+      setUiBusy("scene_select");
       const r = await fetch(`/monitoring/scenes/${productionId}/select`, {
         method:"POST",
         headers:{"Content-Type":"application/json"},
@@ -2500,9 +2889,11 @@ DASHBOARD_HTML = """
       const data = await r.json().catch(() => ({}));
       if(!r.ok){
         selectionStatus.textContent = data.detail || "No se pudo seleccionar escena.";
+        setUiBusy("idle");
         return;
       }
       selectionStatus.textContent = `Produccion ${productionId} | Escena activa: ${sceneName}`;
+      setUiBusy("idle");
     }
 
     async function loadScenesForProduction(productionId){
@@ -2515,7 +2906,7 @@ DASHBOARD_HTML = """
         return;
       }
       sceneSelect.innerHTML = items.map((x, idx) => `
-        <option value="${x.scene_name}" data-scene-date="${x.fecha}" data-truth="${x.truth_tif_exists ? "1" : "0"}" data-render="${x.render_tif_exists ? "1" : "0"}" ${idx===0 ? "selected" : ""}>${sceneOptionText(x)}</option>
+        <option value="${x.scene_name}" data-scene-date="${x.fecha}" data-truth="${x.truth_tif_exists ? "1" : "0"}" data-render="${x.render_tif_exists ? "1" : "0"}" data-ia="${x.ia_exists ? "1" : "0"}" ${idx===0 ? "selected" : ""}>${sceneOptionText(x)}</option>
       `).join("");
       // Siempre seleccionar por defecto la escena mas reciente (index 0 por orden desc).
       const selected = sceneSelect.options[sceneSelect.selectedIndex];
@@ -2525,6 +2916,7 @@ DASHBOARD_HTML = """
       } else {
         output.value = "Escena seleccionada sin TIF en S3. Usa Crear/Actualizar TIF.";
       }
+      await loadIaForSelection(productionId);
     }
 
     async function loadLots(){
@@ -2553,6 +2945,39 @@ DASHBOARD_HTML = """
           selectedRowEl = row;
         }
       }
+    }
+
+    async function bootstrapFromSessionCache(){
+      let importedAny = false;
+      try{
+        const prodRaw = sessionStorage.getItem(SESSION_PRODUCTIONS_KEY);
+        if(prodRaw){
+          const prodItems = JSON.parse(prodRaw);
+          if(Array.isArray(prodItems) && prodItems.length){
+            await fetch("/monitoring/import", {
+              method:"POST",
+              headers:{"Content-Type":"application/json"},
+              body: JSON.stringify({ items: prodItems }),
+            });
+            importedAny = true;
+          }
+        }
+      }catch(e){}
+      try{
+        const scRaw = sessionStorage.getItem(SESSION_SCENES_KEY);
+        if(scRaw){
+          const sceneItems = JSON.parse(scRaw);
+          if(Array.isArray(sceneItems) && sceneItems.length){
+            await fetch("/catalog/scenes/import", {
+              method:"POST",
+              headers:{"Content-Type":"application/json"},
+              body: JSON.stringify({ items: sceneItems }),
+            });
+            importedAny = true;
+          }
+        }
+      }catch(e){}
+      return importedAny;
     }
 
     async function analyzeLot(productionId){
@@ -2586,8 +3011,10 @@ DASHBOARD_HTML = """
     }
 
     async function selectLot(productionId, btnEl){
+      if(isUiBusy()){ return; }
       selectedProductionId = productionId;
       lastAnalysis = null;
+      hasIaPreviewReady = false;
       if(selectedRowEl){ selectedRowEl.classList.remove("selected-row"); }
       selectedRowEl = btnEl;
       if(selectedRowEl){ selectedRowEl.classList.add("selected-row"); }
@@ -2605,9 +3032,11 @@ DASHBOARD_HTML = """
       if(st && st.has_analysis){
         output.value = "Produccion con analisis previo disponible. Puedes subir TIF o crear render segun estado.";
       }
+      await loadIaForSelection(productionId);
     }
 
     async function refreshActionState(){
+      if(isUiBusy()){ return; }
       if(!selectedProductionId){
         analyzeBtn.disabled = true;
         uploadBtn.disabled = true;
@@ -2625,7 +3054,7 @@ DASHBOARD_HTML = """
       backfillBtn.disabled = false;
       renderBtn.disabled = !st.truth_tif_uploaded || st.render_tif_uploaded;
       aiPreviewBtn.disabled = !st.truth_tif_uploaded;
-      aiSaveBtn.disabled = true;
+      aiSaveBtn.disabled = !st.truth_tif_uploaded || !hasIaPreviewReady;
       if(!st.has_analysis){
         selectionStatus.textContent = "No hay TIF generado. Usa Crear/Actualizar TIF.";
       } else if(!st.truth_tif_uploaded){
@@ -2637,38 +3066,32 @@ DASHBOARD_HTML = """
       }
     }
 
-    document.getElementById("importBtn").onclick = async () => {
+    document.getElementById("refreshBtn").onclick = async () => {
+      if(isUiBusy()){ return; }
+      setUiBusy("refresh");
+      uploadStatus.textContent = "Actualizando...";
       try{
-        const parsed = JSON.parse(document.getElementById("jsonInput").value);
-        const r = await fetch("/monitoring/import", {
-          method:"POST",
-          headers:{"Content-Type":"application/json"},
-          body:JSON.stringify(parsed),
-        });
-        const data = await r.json();
-        importStatus.textContent = `Importadas: ${data.imported || 0} | Monitoreadas: ${data.monitored || 0}`;
+        const r = await fetch("/monitoring/import-from-api", { method:"POST" });
+        const data = await r.json().catch(() => ({}));
+        output.value = JSON.stringify(data, null, 2);
+        if(!r.ok){
+          uploadStatus.textContent = (data.detail && (data.detail.error || data.detail.message)) || data.detail || "Error actualizando desde API";
+          return;
+        }
+        const imp = data.import || {};
+        selectionStatus.textContent = `Importadas: ${imp.imported || 0} | Monitoreadas: ${imp.monitored || 0}`;
+        uploadStatus.textContent = `Actualizado desde URL: ${data.source_url || "-"}`;
+        if(data.api_response && Array.isArray(data.api_response.items)){
+          sessionStorage.setItem(SESSION_PRODUCTIONS_KEY, JSON.stringify(data.api_response.items));
+        }
         await loadLots();
       }catch(e){
-        importStatus.textContent = "JSON invalido";
+        uploadStatus.textContent = "Error actualizando desde API";
+      } finally {
+        setUiBusy("idle");
+        await refreshActionState();
       }
     };
-
-    document.getElementById("catalogBtn").onclick = async () => {
-      try{
-        const parsed = JSON.parse(document.getElementById("catalogInput").value);
-        const r = await fetch("/catalog/scenes/import", {
-          method:"POST",
-          headers:{"Content-Type":"application/json"},
-          body:JSON.stringify(parsed),
-        });
-        const data = await r.json();
-        importStatus.textContent = `Catalogo importado: ${data.imported || 0}`;
-      }catch(e){
-        importStatus.textContent = "JSON catalogo invalido";
-      }
-    };
-
-    document.getElementById("refreshBtn").onclick = loadLots;
     reloadScenesBtn.onclick = async () => {
       if(!selectedProductionId){ return; }
       await loadScenesForProduction(selectedProductionId);
@@ -2676,6 +3099,7 @@ DASHBOARD_HTML = """
     sceneSelect.onchange = async () => {
       if(!selectedProductionId){ return; }
       const selected = sceneSelect.options[sceneSelect.selectedIndex];
+      hasIaPreviewReady = false;
       await selectSceneForProduction(selectedProductionId, selected.value, selected.dataset.sceneDate);
       if(selected.dataset.truth === "1" || selected.dataset.render === "1"){
         await analyzeLot(selectedProductionId);
@@ -2688,19 +3112,29 @@ DASHBOARD_HTML = """
         previewPath.textContent = "Esperando analisis...";
         await refreshActionState();
       }
+      await loadIaForSelection(selectedProductionId);
     };
     document.getElementById("analyzeBtn").onclick = async () => {
+      if(isUiBusy()){ return; }
       if(!selectedProductionId){
         uploadStatus.textContent = "Selecciona una produccion primero.";
         return;
       }
-      await analyzeLot(selectedProductionId);
+      setUiBusy("analyze_single");
+      try{
+        await analyzeLot(selectedProductionId);
+      } finally {
+        setUiBusy("idle");
+        await refreshActionState();
+      }
     };
     document.getElementById("uploadBtn").onclick = async () => {
+      if(isUiBusy()){ return; }
       if(!selectedProductionId){
         uploadStatus.textContent = "Selecciona una produccion primero.";
         return;
       }
+      setUiBusy("upload");
       uploadStatus.textContent = "Subiendo a S3...";
       const r = await fetch(`/monitoring/upload/${selectedProductionId}`, {method:"POST"});
       const text = await r.text();
@@ -2708,6 +3142,7 @@ DASHBOARD_HTML = """
       try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text }; }
       if(!r.ok){
         uploadStatus.textContent = data.detail || "Error subiendo a S3";
+        setUiBusy("idle");
         return;
       }
       uploadStatus.textContent = `Subido a S3. Escena registrada: ${data.scene_name}`;
@@ -2717,12 +3152,15 @@ DASHBOARD_HTML = """
         refreshSelectedSceneOptionLabel();
       }
       await refreshActionState();
+      setUiBusy("idle");
     };
     backfillBtn.onclick = async () => {
+      if(isUiBusy()){ return; }
       if(!selectedProductionId){
         uploadStatus.textContent = "Selecciona una produccion primero.";
         return;
       }
+      setUiBusy("backfill");
       const force = confirm("Deseas forzar regeneracion aunque ya existan TIF/params? Aceptar=forzar, Cancelar=solo faltantes.");
       uploadStatus.textContent = "Iniciando backfill historico...";
       backfillProgressBar.style.width = "0%";
@@ -2736,6 +3174,7 @@ DASHBOARD_HTML = """
       if(!r.ok){
         output.value = JSON.stringify(data, null, 2);
         uploadStatus.textContent = data.detail || "Error generando historico.";
+        setUiBusy("idle");
         return;
       }
       const jobId = data.job_id;
@@ -2760,16 +3199,19 @@ DASHBOARD_HTML = """
           uploadStatus.textContent = st.status === "done" ? "Backfill historico finalizado." : `Backfill con error: ${st.error || "ver recuadro"}`;
           await loadScenesForProduction(selectedProductionId);
           await refreshActionState();
+          setUiBusy("idle");
         }
       };
       await poll();
       backfillPollTimer = setInterval(poll, 1200);
     };
     document.getElementById("renderBtn").onclick = async () => {
+      if(isUiBusy()){ return; }
       if(!selectedProductionId){
         uploadStatus.textContent = "Selecciona una produccion primero.";
         return;
       }
+      setUiBusy("render");
       uploadStatus.textContent = "Generando render mejorado...";
       const r = await fetch(`/monitoring/render/${selectedProductionId}`, {method:"POST"});
       const text = await r.text();
@@ -2777,6 +3219,7 @@ DASHBOARD_HTML = """
       try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text }; }
       if(!r.ok){
         uploadStatus.textContent = data.detail || "Error renderizando TIF";
+        setUiBusy("idle");
         return;
       }
       uploadStatus.textContent = data.already_rendered ? "Render ya existia en S3." : "Render generado y subido.";
@@ -2788,12 +3231,15 @@ DASHBOARD_HTML = """
       }
       await refreshActionState();
       await analyzeLot(selectedProductionId);
+      setUiBusy("idle");
     };
     aiPreviewBtn.onclick = async () => {
+      if(isUiBusy()){ return; }
       if(!selectedProductionId){
         uploadStatus.textContent = "Selecciona una produccion primero.";
         return;
       }
+      setUiBusy("ia_preview");
       uploadStatus.textContent = "Generando analisis IA desde params...";
       const r = await fetch(`/monitoring/ia/preview/${selectedProductionId}`, {method:"POST"});
       const text = await r.text();
@@ -2803,17 +3249,25 @@ DASHBOARD_HTML = """
         const detail = data.detail || data;
         output.value = JSON.stringify(detail, null, 2);
         uploadStatus.textContent = "Error generando analisis IA (ver detalle en recuadro).";
+        setUiBusy("idle");
         return;
       }
       output.value = JSON.stringify(data.ia_preview || data, null, 2);
       uploadStatus.textContent = "Analisis IA generado (preview). Revisa y luego guarda si quieres.";
-      aiSaveBtn.disabled = false;
+      hasIaPreviewReady = true;
+      if(!lastAnalysis){ lastAnalysis = {}; }
+      lastAnalysis.ia_preview = data.ia_preview || null;
+      renderIaPanelFromPayload(data.ia_preview || {}, false, "preview local", "Análisis IA preview generado");
+      setUiBusy("idle");
+      await refreshActionState();
     };
     aiSaveBtn.onclick = async () => {
+      if(isUiBusy()){ return; }
       if(!selectedProductionId){
         uploadStatus.textContent = "Selecciona una produccion primero.";
         return;
       }
+      setUiBusy("ia_save");
       uploadStatus.textContent = "Guardando analisis IA en S3...";
       const r = await fetch(`/monitoring/ia/save/${selectedProductionId}`, {method:"POST"});
       const text = await r.text();
@@ -2821,19 +3275,31 @@ DASHBOARD_HTML = """
       try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text }; }
       if(!r.ok){
         uploadStatus.textContent = data.detail || "Error guardando analisis IA";
+        setUiBusy("idle");
         return;
       }
       uploadStatus.textContent = `Analisis IA guardado: ${data.ia_uri || data.ia_key}`;
-      aiSaveBtn.disabled = true;
+      hasIaPreviewReady = false;
+      if(sceneSelect && sceneSelect.selectedIndex >= 0){
+        const opt = sceneSelect.options[sceneSelect.selectedIndex];
+        opt.dataset.ia = "1";
+        refreshSelectedSceneOptionLabel();
+      }
+      await loadIaForSelection(selectedProductionId);
+      setUiBusy("idle");
+      await refreshActionState();
     };
     resetBtn.onclick = async () => {
+      if(isUiBusy()){ return; }
       const yes = confirm("Esto limpiara cache, producciones cargadas y temporales locales. Deseas continuar?");
       if(!yes){ return; }
+      setUiBusy("reset");
       uploadStatus.textContent = "Limpiando cache y temporales...";
       const r = await fetch("/monitoring/reset", { method:"POST" });
       const data = await r.json().catch(() => ({}));
       if(!r.ok){
         uploadStatus.textContent = data.detail || "Error limpiando estado.";
+        setUiBusy("idle");
         return;
       }
       selectedProductionId = null;
@@ -2849,10 +3315,30 @@ DASHBOARD_HTML = """
       previewPath.textContent = "Esperando analisis...";
       selectionStatus.textContent = "Selecciona una produccion para habilitar acciones.";
       uploadStatus.textContent = "Cache y temporales limpiados. Vuelve a cargar producciones.";
+      iaStatus.textContent = "Selecciona una escena para cargar análisis IA.";
+      iaPanel.innerHTML = "";
+      sessionStorage.removeItem(SESSION_PRODUCTIONS_KEY);
+      sessionStorage.removeItem(SESSION_SCENES_KEY);
       await refreshActionState();
+      setUiBusy("idle");
     };
-    loadLots();
-    refreshActionState();
+    (async () => {
+      try{
+        const r = await fetch("/monitoring/import-from-api", { method:"POST" });
+        const data = await r.json().catch(() => ({}));
+        if(r.ok){
+          if(data.api_response && Array.isArray(data.api_response.items)){
+            sessionStorage.setItem(SESSION_PRODUCTIONS_KEY, JSON.stringify(data.api_response.items));
+          }
+        } else {
+          await bootstrapFromSessionCache();
+        }
+      }catch(e){
+        await bootstrapFromSessionCache();
+      }
+      await loadLots();
+      await refreshActionState();
+    })();
     (async () => {
       try{
         const r = await fetch("/internal/config/view");
